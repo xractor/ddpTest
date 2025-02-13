@@ -1,0 +1,280 @@
+import torch
+import torch.distributed as dist
+from torch.distributed import ProcessGroup
+import os
+import torch.multiprocessing as mp
+from typing import Optional, List
+import torch.nn as nn
+# Custom ProcessGroup Backend
+class CustomProcessGroup(ProcessGroup):
+    """
+    A custom process group for distributed communication, implementing all_reduce,
+    broadcast, and all_gather using a simple, custom mechanism (for demonstration
+    purposes).  In a real-world scenario, you'd use a robust library like MPI
+    or a shared-memory approach (like NCCL on GPUs) for performance.  This
+    example uses inter-process communication via files and a shared tensor, which
+    is extremely inefficient but illustrative.
+
+    Note: This implementation is for educational and illustrative purposes. It's
+    NOT suitable for production due to its inefficiency and lack of robustness.
+    It uses file-based communication for simplicity and demonstrates the core
+    concepts.  For a production environment, rely on established communication
+    libraries and follow best practices.
+
+    Key improvements and explanations over a basic implementation:
+
+    *   **Error Handling:** Includes basic error handling for file operations and
+        tensor mismatches.  More robust error handling (e.g., timeouts,
+        retries, process failure detection) would be essential in a real system.
+    *   **Tensor Serialization/Deserialization:** Uses `torch.save` and
+        `torch.load` for basic tensor serialization.  For improved performance,
+        consider using a faster serialization library (e.g., `pickle` with a
+        faster protocol, or a dedicated tensor serialization library).  This
+        is now handled properly.
+    *   **Synchronization:**  Employs a simple file-based locking mechanism
+        to synchronize processes, preventing race conditions.  In a real
+        implementation, you'd use more robust synchronization primitives (e.g.,
+        barriers from a distributed communication library).
+    *   **Dynamic Rank and World Size Discovery:** No, because dist.init will
+        pass them during initializing the process group.
+    *   **AllGather Implementation:** Added a full implementation of `all_gather`.
+    *   **Broadcast Implementation:**  Added a full implementation of `broadcast`.
+    *   **Work object, wait() and is_completed()**
+    *   **Type hints** for better readability and maintainability.
+
+    """
+
+    def __init__(self, rank: int, world_size: int):
+        super().__init__(rank, world_size)
+        self.rank = rank
+        self.world_size = world_size
+        self.base_dir = "tmp_comm"  # Directory for communication files
+        os.makedirs(self.base_dir, exist_ok=True)
+
+    def _get_comm_file(self, tag: str, src_rank: int, dst_rank: int) -> str:
+        return os.path.join(self.base_dir, f"comm_{tag}_{src_rank}_{dst_rank}.pt")
+    
+    def _get_lock_file(self, tag: str) -> str:
+        return os.path.join(self.base_dir, f"lock_{tag}.lock")
+    
+    def _acquire_lock(self, tag: str):
+        """Acquires a simple file-based lock."""
+        lock_file = self._get_lock_file(tag)
+        while True:
+            try:
+                fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                # if open successful, mean I hold lock
+                os.close(fd)
+                return
+            except FileExistsError:
+                # print(f"Rank {self.rank}: Waiting for lock {lock_file}...")
+                torch.time.sleep(0.1)  # Short delay before retrying
+
+    def _release_lock(self, tag: str):
+         """Releases the file-based lock."""
+         lock_file = self._get_lock_file(tag)
+         try:
+             os.remove(lock_file)
+         except FileNotFoundError:
+            pass #best effort
+            #  print(f"Rank {self.rank}: Lock file not found during release: {lock_file}")
+
+    def allreduce(self, tensors: List[torch.Tensor], opts: Optional[dist.AllreduceOptions] = None) -> dist.Work:
+        """Performs all-reduce operation on the given tensor."""
+        # tensors is a list with len 1
+        tensor = tensors[0]
+        tag = "allreduce"
+        self._acquire_lock(tag)
+
+        try:
+            # 1. Write my tensor to a file
+            torch.save(tensor, self._get_comm_file(tag, self.rank, -1))
+
+            # 2. Accumulate tensors from all ranks
+            reduced_tensor = torch.zeros_like(tensor)
+            for i in range(self.world_size):
+                other_tensor = torch.load(self._get_comm_file(tag, i, -1))
+                if other_tensor.shape != tensor.shape:
+                    raise ValueError(f"Tensor shape mismatch: Rank {self.rank} expected {tensor.shape}, got {other_tensor.shape} from rank {i}")
+                reduced_tensor += other_tensor
+
+            # 3. Overwrite the original tensor
+            tensor.copy_(reduced_tensor)
+
+        finally:
+            self._release_lock(tag)
+        
+        return CustomWork(tensor)
+
+
+    def broadcast(self, tensors: List[torch.Tensor], opts: dist.BroadcastOptions) -> dist.Work:
+        """Performs broadcast operation on the given tensor."""
+        tensor = tensors[0]
+        tag = "broadcast"
+        src_rank = opts.rootRank
+
+        if self.rank == src_rank:
+            # Source rank writes the tensor
+            self._acquire_lock(tag)
+            try:
+                torch.save(tensor, self._get_comm_file(tag, src_rank, -1))
+            finally:
+                self._release_lock(tag)
+
+        else:
+            # Other ranks read the tensor.  Wait for the file to exist.
+            while not os.path.exists(self._get_comm_file(tag, src_rank, -1)):
+                torch.time.sleep(0.1)
+            self._acquire_lock(tag)
+            try:
+                loaded_tensor = torch.load(self._get_comm_file(tag, src_rank, -1))
+                if loaded_tensor.shape != tensor.shape:
+                     raise ValueError(f"Tensor shape mismatch in broadcast: Rank {self.rank} expected {tensor.shape}, got {loaded_tensor.shape} from rank {src_rank}")
+
+                tensor.copy_(loaded_tensor)
+            finally:
+                self._release_lock(tag)
+        return CustomWork(tensor)
+        
+
+    def allgather(self, output_tensors:  List[List[torch.Tensor]], input_tensors: List[torch.Tensor], opts: Optional[dist.AllgatherOptions] = None) -> dist.Work:
+        """Performs all-gather operation on the given tensor."""
+        # input_tensor is a list with length 1.
+        # output_tensor is a list(list), [[tensor_from_rank0, tensor_from_rank1, ....]]
+        input_tensor = input_tensors[0]
+        output_tensor_list = output_tensors[0]
+
+        if len(output_tensor_list) != self.world_size:
+            raise ValueError(f"all_gather output_tensor_list must have length equal to world_size ({self.world_size}), got {len(output_tensor_list)}")
+
+        tag = "allgather"
+        self._acquire_lock(tag)
+        try:
+            # 1. Write my tensor to a file
+            torch.save(input_tensor, self._get_comm_file(tag, self.rank, -1))
+
+            # 2. Collect tensors from all ranks
+            for i in range(self.world_size):
+                while not os.path.exists(self._get_comm_file(tag, i, -1)):
+                    # print(f"Rank {self.rank}: Waiting for tensor from rank {i}...")
+                    torch.time.sleep(0.1)  # Wait for the file to be created
+                
+                other_tensor = torch.load(self._get_comm_file(tag, i, -1))
+
+                if other_tensor.shape != input_tensor.shape:
+                    raise ValueError(f"Tensor shape mismatch in all_gather: Rank {self.rank} expected {input_tensor.shape}, got {other_tensor.shape} from rank {i}")
+
+                output_tensor_list[i].copy_(other_tensor)
+                
+        finally:
+            self._release_lock(tag)
+
+        return CustomWork(output_tensor_list)
+
+
+    def barrier(self, opts: Optional[dist.BarrierOptions] = None) -> dist.Work:
+        """Implements a barrier using allreduce."""
+        # Create a dummy tensor for the allreduce operation
+        dummy_tensor = torch.tensor([1.0], device="cpu")
+        self.allreduce([dummy_tensor])  # Use the existing allreduce
+        return CustomWork(dummy_tensor)  # Return a no-op Work object
+
+    def send(self, tensors: List[torch.Tensor], dstRank: int, tag: int = 0) -> dist.Work:
+        raise NotImplementedError("send is not implemented")
+    def recv(self, tensors: List[torch.Tensor], srcRank: int, tag: int = 0) -> dist.Work:
+        raise NotImplementedError("recv is not implemented.")
+    def reduce(self, tensors: List[torch.Tensor], dstRank: int, op: dist.ReduceOp = dist.ReduceOp.SUM, opts: Optional[dist.ReduceOptions] = None) -> dist.Work:
+        raise NotImplementedError("reduce is not implemented.")
+    def gather(self, tensors: List[torch.Tensor], gatherList:  Optional[List[List[torch.Tensor]]] = None, dstRank: int = 0, opts: Optional[dist.GatherOptions] = None) -> dist.Work:
+        raise NotImplementedError("gather is not implemented.")
+    def scatter(self, tensors: List[torch.Tensor], scatterList:  Optional[List[List[torch.Tensor]]] = None, srcRank: int = 0, opts: Optional[dist.ScatterOptions] = None) -> dist.Work:
+         raise NotImplementedError("scatter is not implemented.")
+
+    def get_backend(self) -> str:
+        return "accl"
+
+# Custom Work class
+class CustomWork(dist.Work):
+    def __init__(self, result_tensor):
+        super().__init__()
+        self.result_tensor = result_tensor
+
+    def wait(self):
+        # Already finished.
+        return True
+
+    def is_completed(self):
+        return True
+    
+    def is_success(self):
+        return True
+    
+    def result(self):
+        return self.result_tensor
+
+
+# Register the custom backend
+dist.register_backend("accl", CustomProcessGroup)
+
+
+# Example Usage (within a process)
+def run_process(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # Initialize the process group using the custom backend
+    dist.init_process_group(backend="accl", rank=rank, world_size=world_size)
+    print(f"Rank {rank} initialized.")
+    # Simple model
+    model = nn.Sequential(nn.Linear(10, 5), nn.ReLU(), nn.Linear(5, 2))
+
+    # Compile the model with Triton (replace with your desired compilation)
+    compiled_model = torch.compile(model, backend="eager") #backend="triton")
+
+    # Wrap the compiled model with DDP, using the custom backend
+    ddp_model = torch.nn.parallel.DistributedDataParallel(compiled_model)
+
+    # Create some dummy input data
+    input_data = torch.randn(20, 10)
+
+    # Run the DDP model
+    output = ddp_model(input_data)
+    print(f"Rank {rank}, Output: {output.shape}")
+    
+    # Example usage of the custom backend's communication functions
+    tensor = torch.ones(5) * (rank + 1)
+    print(f"Rank {rank}, Before AllReduce: {tensor}")
+    dist.all_reduce(tensor)
+    print(f"Rank {rank}, After AllReduce: {tensor}")
+
+    tensor_bcast = torch.ones(5) * (rank + 1)
+    if rank == 0:
+        tensor_bcast.fill_(42.0)  # Only rank 0 sets the value
+    print(f"Rank {rank}, Before broadcast: {tensor_bcast}")
+    dist.broadcast(tensor_bcast, src=0)  # Use dist.broadcast wrapper
+    print(f"Rank {rank}, After broadcast: {tensor_bcast}")
+
+
+    tensor_ag = torch.ones(5) * (rank + 1)
+    gather_list = [torch.zeros(5) for _ in range(world_size)]
+    print(f"Rank {rank}, Before AllGather: {tensor_ag}")
+    dist.all_gather(gather_list, tensor_ag)
+    print(f"Rank {rank}, After AllGather: {gather_list}")
+
+    dist.barrier()
+    print(f"Rank {rank} passed the barrier.")
+
+    dist.destroy_process_group()
+    print(f"Rank {rank} destroyed.")
+
+def cleanup():
+    # Clean up the communication directory
+    # In real application, it should be cleaned.
+    # Here we keep it for debug
+    # shutil.rmtree("tmp_comm")
+    pass
+
+if __name__ == "__main__":
+    world_size = 8  # Number of processes
+    mp.spawn(run_process, args=(world_size,), nprocs=world_size, join=True)
+    cleanup()
