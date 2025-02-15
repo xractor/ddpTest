@@ -16,17 +16,11 @@ class CustomWork(dist.Work):
 # 2. Define a custom ProcessGroup by subclassing torch.distributed.ProcessGroup.
 ###############################################################################
 class CustomProcessGroup(dist.ProcessGroup):
-    def __init__(self, store, rank, world_size, timeout=None, backend_opts=None):
-        """
-        Accepts the extra arguments (store, timeout, backend_opts) that the
-        PyTorch distributed framework passes in during initialization.
-        """
+    def __init__(self, rank, size):
+        # The base class takes no arguments so we only record rank and world_size.
         super().__init__()
-        self.store = store
         self.rank = rank
-        self.world_size = world_size
-        self.timeout = timeout
-        self.backend_opts = backend_opts
+        self.size = size
 
     def allreduce(self, tensor, opts=None):
         # For demonstration, we “simulate” an allreduce by simply cloning the tensor.
@@ -81,7 +75,6 @@ try:
 
 except ImportError:
     print("Triton not available; falling back to CPU multiplication.")
-
     def run_triton_kernel(x):
         # Fallback “kernel” for CPU: simply multiply by 2.
         return x * 2
