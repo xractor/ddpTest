@@ -1,93 +1,120 @@
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.distributed import ProcessGroup, Backend
-from torch.utils.cpp_extension import load_inline
 
-# Custom Process Group Implementation
-class CustomProcessGroup(ProcessGroup):
+###############################################################################
+# 1. Define a custom Work handle that mimics an asynchronous operation.
+###############################################################################
+class CustomWork(dist.Work):
+    def __init__(self, tensor):
+        self._tensor = tensor
+
+    def wait(self):
+        # In a real async operation, wait for completion.
+        return self._tensor
+
+###############################################################################
+# 2. Define a custom ProcessGroup by subclassing torch.distributed.ProcessGroup.
+###############################################################################
+class CustomProcessGroup(dist.ProcessGroup):
     def __init__(self, rank, size):
+        # The base class takes no arguments so we only record rank and world_size.
         super().__init__()
         self.rank = rank
         self.size = size
-        # In a real implementation, you would use a proper communication library (e.g., MPI, Gloo)
-        # Here, we use a simple shared memory approach for demonstration purposes on CPU.
-        self.shared_mem = {}
 
-    def allreduce(self, tensor):
-        # Simplified allreduce using shared memory (for demonstration)
-        name = f"allreduce_{tensor.data_ptr()}" # Unique name for each tensor
-        if self.rank == 0:
-            total = tensor.clone()
-            for i in range(1, self.size):
-                other_tensor = self.shared_mem[f"allreduce_{tensor.data_ptr()}_{i}"]
-                total += other_tensor
-            for i in range(1, self.size):
-                self.shared_mem[f"allreduce_{tensor.data_ptr()}_{i}"] = total.clone()
-            tensor.copy_(total)  # Update original tensor
-        else:
-            self.shared_mem[name] = tensor.clone()
-            while f"allreduce_{tensor.data_ptr()}" not in self.shared_mem:  # Wait for rank 0
-                pass
-            tensor.copy_(self.shared_mem[f"allreduce_{tensor.data_ptr()}"])
+    def allreduce(self, tensor, opts=None):
+        # For demonstration, we “simulate” an allreduce by simply cloning the tensor.
+        # In a multi–process environment, you would sum (or reduce) the tensor across ranks.
+        print(f"[Rank {self.rank}] Called allreduce on tensor: {tensor}")
+        result = tensor.clone()
+        return CustomWork(result)
 
-    def broadcast(self, tensor, src):
-        name = f"broadcast_{tensor.data_ptr()}"
-        if self.rank == src:
-            for i in range(self.size):
-                if i != src:
-                    self.shared_mem[f"broadcast_{tensor.data_ptr()}_{i}"] = tensor.clone()
-        else:
-            while name not in self.shared_mem:
-                pass
-            tensor.copy_(self.shared_mem[name])
+    def broadcast(self, tensor, opts=None):
+        # Simulate broadcast by cloning the tensor.
+        print(f"[Rank {self.rank}] Called broadcast on tensor: {tensor}")
+        result = tensor.clone()
+        return CustomWork(result)
 
-    def allgather(self, tensor_list, tensor):
-        name = f"allgather_{tensor.data_ptr()}"
-        self.shared_mem[name + f'_{self.rank}'] = tensor.clone()
+    def allgather(self, tensor_list, tensor, opts=None):
+        # Simulate allgather by clearing and appending the input tensor.
+        print(f"[Rank {self.rank}] Called allgather on tensor: {tensor}")
+        tensor_list.clear()
+        tensor_list.append(tensor.clone())
+        return CustomWork(tensor_list)
 
-        if self.rank == 0:
-          for i in range(self.size):
-            while name + f'_{i}' not in self.shared_mem:
-              pass
-          for i in range(self.size):
-            tensor_list[i].copy_(self.shared_mem[name + f'_{i}'])
-        else:
-          while name + f'_0' not in self.shared_mem:
-            pass
-          for i in range(self.size):
-            while name + f'_{i}' not in self.shared_mem:
-              pass
+###############################################################################
+# 3. Register the custom backend with the distributed module.
+###############################################################################
+# The register_backend API takes a backend name and a ProcessGroup class.
+dist.Backend.register_backend("custom", CustomProcessGroup)
 
-def init_custom_distributed(rank, size):
-    dist.Backend.register_backend("custom", lambda *args, **kwargs: CustomProcessGroup(rank, size))
-    dist.init_process_group(backend="custom", rank=rank, world_size=size)
+###############################################################################
+# 4. Define a Triton kernel (if available) and a fallback for CPU testing.
+###############################################################################
+try:
+    import triton
+    import triton.language as tl
 
+    @triton.jit
+    def triton_kernel(X, Y, N: tl.constexpr):
+        # A simple kernel: each thread loads an element from X, multiplies by 2, and writes to Y.
+        pid = tl.program_id(0)
+        BLOCK_SIZE = 128  # number of elements per block
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < N
+        x_vals = tl.load(X + offsets, mask=mask)
+        tl.store(Y + offsets, x_vals * 2, mask=mask)
 
-# Example model and training step with Triton and custom backend
-@torch.compile()  # Using torch.compile with triton
-def compiled_train_step(model, input_data, target, optimizer):
-    output = model(input_data)
-    loss = torch.nn.functional.mse_loss(output, target)  # Example loss
-    loss.backward()
-    optimizer.step()
-    return loss
+    def run_triton_kernel(x):
+        # Launch the Triton kernel.
+        N = x.numel()
+        y = torch.empty_like(x)
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]),)
+        triton_kernel[grid](x, y, N, BLOCK_SIZE=128)
+        return y
 
-def train(rank, size):
-    init_custom_distributed(rank, size) # initialize distributed env.
-    model = torch.nn.Linear(10, 5)  # Simple model
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+except ImportError:
+    print("Triton not available; falling back to CPU multiplication.")
+    def run_triton_kernel(x):
+        # Fallback “kernel” for CPU: simply multiply by 2.
+        return x * 2
 
-    for _ in range(5):  # Example training loop
-        input_data = torch.randn(5, 10) #.to(rank)  # Example input data
-        target = torch.randn(5, 5) #.to(rank)       # Example target data
-        loss = compiled_train_step(model, input_data, target, optimizer)
-        if rank == 0:
-            print(f"Rank {rank} Loss: {loss.item()}")
+###############################################################################
+# 5. Define a function that uses our “Triton” kernel and calls a distributed op.
+###############################################################################
+def compute_and_communicate(x):
+    # Use the (compiled) Triton kernel to compute y = x * 2.
+    y = run_triton_kernel(x)
+    # Now “allreduce” y. (For a single process, our custom backend just returns a clone.)
+    work = dist.all_reduce(y)
+    y = work.wait()
+    return y
 
+###############################################################################
+# 6. Main driver: initialize the custom process group, compile the function, and run it.
+###############################################################################
+def main():
+    # For easy CPU testing, we set rank=0 and world_size=1.
+    rank = 0
+    world_size = 1
+
+    # Initialize the process group using our custom backend.
+    # (In a real multi–process job you would pass an appropriate init_method.)
+    dist.init_process_group(backend="custom", rank=rank, world_size=world_size)
+
+    # Create an input tensor.
+    x = torch.tensor([1.0, 2.0, 3.0])
+    print("Input tensor:", x)
+
+    # Use torch.compile to optimize the function.
+    compiled_func = torch.compile(compute_and_communicate)
+
+    # Run the compiled function.
+    result = compiled_func(x)
+    print("Result tensor:", result)
+
+    # Cleanup the process group.
     dist.destroy_process_group()
 
-
 if __name__ == "__main__":
-    world_size = 2  # Number of processes
-    mp.spawn(train, args=(world_size,), nprocs=world_size, join=True)
+    main()
