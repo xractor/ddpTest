@@ -4,7 +4,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import datetime
 
-# 1. Custom ProcessGroup Implementation
+# 1. Custom ProcessGroup Implementation (CORRECTED)
 
 class CustomProcessGroup(ProcessGroup):
     """
@@ -13,49 +13,34 @@ class CustomProcessGroup(ProcessGroup):
 
     def __init__(self, rank, size, group_name, timeout=datetime.timedelta(seconds=30)):
         super().__init__(rank, size, timeout=timeout)
-        self.rank = rank
-        self.size = size
+        self._rank = rank  # Use a different attribute name!
+        self._group_size = size
         self.group_name = group_name
         print(f"CustomProcessGroup initialized: rank={rank}, size={size}, group_name={group_name}")
 
-    # ... (rest of the methods: allreduce, broadcast, allgather, barrier - no changes) ...
     def allreduce(self, tensors, op=dist.ReduceOp.SUM, async_op=False):
-        """
-        All-reduces the tensor across the group.
-
-        Args:
-            tensors (List[torch.Tensor]): List containing a single tensor to all-reduce.
-            op (dist.ReduceOp, optional): Reduction operation (SUM, MIN, MAX, PRODUCT). Defaults to SUM.
-            async_op (bool, optional):  Whether the operation is asynchronous.  Not supported in this basic implementation.
-
-        Returns:
-            torch.futures.Future: A future object (completed immediately in this sync implementation).
-        """
         if async_op:
             raise NotImplementedError("Asynchronous operations not supported in CustomProcessGroup")
         if len(tensors) != 1:
             raise ValueError("CustomProcessGroup.allreduce only supports a single tensor.")
 
         tensor = tensors[0]
-
-        # Check if the tensor is on CPU, if not, move it to CPU
         if tensor.device != torch.device('cpu'):
             tensor = tensor.cpu()
 
         reduced_tensor = tensor.clone()
 
-        for i in range(self.size):
-            if i != self.rank:
-                # Simulate receiving from other ranks (blocking)
-                other_tensor = torch.empty_like(tensor) # Allocate space.
-                if self.rank < i: #Simple send/recv to avoid deadlock
+        for i in range(self._group_size):
+            if i != self._rank:
+                # Ensure the receiving tensor is on the CPU.
+                other_tensor = torch.empty_like(tensor, device='cpu')  # Explicitly on CPU
+                if self._rank < i:
                     torch.distributed.send(tensor, i)
-                    torch.distributed.recv(other_tensor, i)
+                    torch.distributed.recv(other_tensor, src=i) # src=i is correct
                 else:
-                    torch.distributed.recv(other_tensor, i)
+                    torch.distributed.recv(other_tensor, src=i) # src=i is correct
                     torch.distributed.send(tensor, i)
 
-                # Apply the reduction operation
                 if op == dist.ReduceOp.SUM:
                     reduced_tensor += other_tensor
                 elif op == dist.ReduceOp.MIN:
@@ -67,99 +52,65 @@ class CustomProcessGroup(ProcessGroup):
                 else:
                     raise ValueError(f"Unsupported reduction operation: {op}")
 
-        # Update the original tensor
         tensor.copy_(reduced_tensor)
-        tensors[0] = tensor # Modify the input list in place (required by ProcessGroup API).
+        tensors[0] = tensor
         future = torch.futures.Future()
-        future.set_result(None) # Mark as immediately completed (synchronous)
+        future.set_result(None)
         return future
 
 
-
     def broadcast(self, tensors, src, async_op=False):
-        """
-        Broadcasts the tensor from the source rank to all other ranks.
-
-        Args:
-            tensors (List[torch.Tensor]): List containing a single tensor to broadcast.
-            src (int): Source rank.
-            async_op (bool, optional): Whether the operation is asynchronous.
-
-        Returns:
-            torch.futures.Future: A future object.
-        """
-
         if async_op:
             raise NotImplementedError("Asynchronous operations not supported")
         if len(tensors) != 1:
             raise ValueError("CustomProcessGroup.broadcast only supports a single tensor.")
 
         tensor = tensors[0]
-
-        # Check if the tensor is on CPU, if not, move it to CPU
         if tensor.device != torch.device('cpu'):
             tensor = tensor.cpu()
 
-        if self.rank == src:
-            # Source rank: Send the tensor to all other ranks.
-            for i in range(self.size):
+        if self._rank == src:
+            for i in range(self._group_size):
                 if i != src:
                     torch.distributed.send(tensor, i)
         else:
-            # Other ranks: Receive the tensor from the source rank.
-            torch.distributed.recv(tensor, src) # tensor already allocated
+            # Ensure the receiving tensor is on the CPU.
+            # No need to allocate a new tensor, 'tensor' is already allocated
+            torch.distributed.recv(tensor, src=src)  # src is correct
 
-        tensors[0] = tensor # Modify in-place
+        tensors[0] = tensor
         future = torch.futures.Future()
         future.set_result(None)
         return future
 
 
-
     def allgather(self, output_tensors, input_tensors, async_op=False):
-        """
-        All-gathers tensors from all ranks and stores them in output_tensors.
-
-        Args:
-            output_tensors (List[List[torch.Tensor]]):  List of lists of tensors to store results.
-                output_tensors[i] will contain the gathered tensor from rank i.
-            input_tensors (List[torch.Tensor]):  List containing a single tensor to gather.
-            async_op (bool, optional): Whether the operation is asynchronous.
-
-        Returns:
-            torch.futures.Future: A future object.
-        """
-
         if async_op:
             raise NotImplementedError("Asynchronous operations not supported")
         if len(input_tensors) != 1:
             raise ValueError("CustomProcessGroup.allgather only supports a single input tensor.")
-        if len(output_tensors) != self.size:
-             raise ValueError(f"output_tensors should have length {self.size}")
+        if len(output_tensors) != self._group_size:
+             raise ValueError(f"output_tensors should have length {self._group_size}")
 
         input_tensor = input_tensors[0]
-
-        # Check if the input tensor is on CPU, if not, move it to CPU
         if input_tensor.device != torch.device('cpu'):
             input_tensor = input_tensor.cpu()
 
-        # Send and receive tensors to/from all other ranks.
-        for i in range(self.size):
-             if len(output_tensors[i]) != 1:
+        for i in range(self._group_size):
+            if len(output_tensors[i]) != 1:
                 raise ValueError("Each list in output_tensors should contain exactly one tensor.")
 
-             # Check if the tensor is on CPU, if not, move it to CPU
-             if output_tensors[i][0].device != torch.device('cpu'):
+            # Ensure output tensor is on the CPU
+            if output_tensors[i][0].device != torch.device('cpu'):
                 output_tensors[i][0] = output_tensors[i][0].cpu()
 
-             if i == self.rank:
-                output_tensors[i][0].copy_(input_tensor)  # Copy local tensor
-
-             if self.rank < i: # Simple send/recv to avoid deadlock
+            if i == self._rank:
+                output_tensors[i][0].copy_(input_tensor)
+            elif self._rank < i:
                 torch.distributed.send(input_tensor, i)
-                torch.distributed.recv(output_tensors[i][0],i)
-             elif self.rank > i:
-                torch.distributed.recv(output_tensors[i][0],i)
+                torch.distributed.recv(output_tensors[i][0], src=i) # src=i is correct
+            else: # self._rank > i
+                torch.distributed.recv(output_tensors[i][0], src=i)  # src=i is correct
                 torch.distributed.send(input_tensor, i)
 
 
@@ -175,10 +126,10 @@ class CustomProcessGroup(ProcessGroup):
         if async_op:
             raise NotImplementedError("Asynchronous barrier not supported")
 
-        tensor = torch.tensor([self.rank], dtype=torch.int)
+        tensor = torch.tensor([self._rank], dtype=torch.int, device='cpu') # Ensure on CPU
 
-        if self.rank == 0:
-            for i in range(1, self.size):
+        if self._rank == 0:
+            for i in range(1, self._group_size):
                 recv_tensor = torch.empty_like(tensor)
                 torch.distributed.recv(recv_tensor, i)
         else:
@@ -190,7 +141,7 @@ class CustomProcessGroup(ProcessGroup):
         future.set_result(None)
         return future
 
-# Factory function to create the CustomProcessGroup (CORRECTED)
+# Factory function to create the CustomProcessGroup
 def custom_process_group_factory(*args, **kwargs):
     rank = args[1]
     size = args[2]
