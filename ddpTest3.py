@@ -2,24 +2,25 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+import datetime
 
-# 1. Custom ProcessGroup Implementation
+# 1. Custom ProcessGroup Implementation (CORRECTED)
 
 class CustomProcessGroup(ProcessGroup):
     """
-    A custom ProcessGroup implementation providing all_reduce, broadcast, and all_gather.
-    This implementation uses basic PyTorch tensor operations and is intended for
-    CPU-based operations for demonstration and testing purposes.  It is NOT
-    optimized for performance and should not be used in production environments
-    where high-performance communication is required.
+    A custom ProcessGroup implementation.
     """
 
-    def __init__(self, rank, size):
-        super().__init__(rank, size)
+    def __init__(self, store, rank, size, group_name, timeout=datetime.timedelta(seconds=30)):
+        super().__init__(rank, size, timeout=timeout)  # Pass timeout to superclass
         self.rank = rank
         self.size = size
-        self.group_name = f"custom_group_{rank}_{size}"  # Unique name (for logging)
+        self.store = store # We don't use store, but we must accept it
+        self.group_name = group_name # We can use group_name for logging
+        print(f"CustomProcessGroup initialized: rank={rank}, size={size}, group_name={group_name}")
 
+    # ... (rest of the methods: allreduce, broadcast, allgather, barrier) ...
+    # The method implementations remain the same as in the previous, complete example
     def allreduce(self, tensors, op=dist.ReduceOp.SUM, async_op=False):
         """
         All-reduces the tensor across the group.
