@@ -12,11 +12,10 @@ class CustomProcessGroup(ProcessGroup):
     """
 
     def __init__(self, rank, size, group_name, timeout=datetime.timedelta(seconds=30)):
-        super().__init__(rank, size, timeout=timeout)  # Pass timeout to superclass
+        super().__init__(rank, size, timeout=timeout)
         self.rank = rank
         self.size = size
-        # self.store = store  # No longer needed in the constructor
-        self.group_name = group_name  # We can use group_name for logging
+        self.group_name = group_name
         print(f"CustomProcessGroup initialized: rank={rank}, size={size}, group_name={group_name}")
 
     # ... (rest of the methods: allreduce, broadcast, allgather, barrier - no changes) ...
@@ -191,10 +190,12 @@ class CustomProcessGroup(ProcessGroup):
         future.set_result(None)
         return future
 
-# Factory function to create the CustomProcessGroup
-def custom_process_group_factory(store, rank, size, timeout=datetime.timedelta(seconds=30)):
-    group_name = f"custom_group_{rank}_{size}" # Or generate a unique name
-    return CustomProcessGroup(rank, size, group_name, timeout=timeout)
+# Factory function to create the CustomProcessGroup (CORRECTED)
+def custom_process_group_factory(*args, **kwargs):
+    rank = args[1]
+    size = args[2]
+    group_name = f"custom_group_{rank}_{size}"
+    return CustomProcessGroup(rank, size, group_name, timeout=kwargs.get('timeout', datetime.timedelta(seconds=30)))
 
 # 2. Backend Registration (using the factory function)
 dist.Backend.register_backend("custom_cpu", custom_process_group_factory)
@@ -253,30 +254,32 @@ def run_example(rank, size):
     dist.broadcast(tensor_a, src=0)
     dist.broadcast(tensor_b, src=0)
 
-     # Compile the Triton kernel with torch.compile
+    # Compile the Triton kernel with torch.compile
     compiled_kernel = torch.compile(triton_kernel, backend="inductor")
 
-     # Run the compiled kernel
+    # Run the compiled kernel
     compiled_kernel(tensor_a, tensor_b, tensor_out)
 
-     # All-gather the results (optional, for verification)
+
+    # All-gather the results (optional, for verification)
     gathered_tensors = [torch.empty_like(tensor_out) for _ in range(size)]
     dist.all_gather(gathered_tensors, tensor_out)
 
-     # All-reduce a different tensor to demonstrate allreduce
+    # All-reduce a different tensor to demonstrate allreduce
     reduce_tensor = torch.tensor([float(rank + 1)], device="cpu")  # Different values on each rank
     dist.all_reduce(reduce_tensor, op=dist.ReduceOp.SUM)
 
-    dist.barrier()  # Make sure all processes finish before cleanup
+    dist.barrier() # Make sure all processes finish before cleanup
     if rank == 0:
-        # Verify the all-gathered results. Each gathered tensor should be
+        # Verify the all-gathered results.  Each gathered tensor should be
         # equal to tensor_out (which is tensor_a + tensor_b).
         for i, gathered_tensor in enumerate(gathered_tensors):
-            assert torch.allclose(gathered_tensor, tensor_a + tensor_b), f"Rank {rank}: Allgather verification failed at rank {i}."
-         # Verify the all-reduce result.  The sum should be (size * (size + 1)) / 2.
+             assert torch.allclose(gathered_tensor, tensor_a + tensor_b), f"Rank {rank}: Allgather verification failed at rank {i}."
+        # Verify the all-reduce result.  The sum should be (size * (size + 1)) / 2.
         expected_sum = (size * (size + 1)) / 2
         assert torch.allclose(reduce_tensor, torch.tensor([expected_sum])), f"Allreduce verification failed. Expected {expected_sum}, got {reduce_tensor}"
         print("All verifications passed!")
+
 
     cleanup()
 
